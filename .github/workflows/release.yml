@@ -1,0 +1,102 @@
+name: Create Release
+
+on:
+  push:
+    branches:
+      - release
+
+jobs:
+  create_release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Extract version from Cargo.toml
+        id: get_version
+        run: |
+          VERSION=$(grep -m1 'version = "' Cargo.toml | sed 's/version = "//g' | sed 's/"//g')
+          echo "CARGO_VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Extracted version: $VERSION"
+
+      - name: Check if release exists
+        id: check_release
+        run: |
+          RELEASE_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/${{ github.repository }}/releases/tags/v${{ env.CARGO_VERSION }}")
+          if [ "$RELEASE_EXISTS" == "200" ]; then
+            echo "RELEASE_EXISTS=true" >> $GITHUB_ENV
+            echo "Release for v${{ env.CARGO_VERSION }} already exists."
+          else
+            echo "RELEASE_EXISTS=false" >> $GITHUB_ENV
+            echo "No release found for v${{ env.CARGO_VERSION }}."
+          fi
+
+      - name: Build
+        if: env.RELEASE_EXISTS == 'false'
+        run: cargo build --release
+
+      - name: Run tests
+        if: env.RELEASE_EXISTS == 'false'
+        run: cargo test --release
+
+      - name: Create Release
+        if: env.RELEASE_EXISTS == 'false'
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ env.CARGO_VERSION }}
+          release_name: Release v${{ env.CARGO_VERSION }}
+          draft: false
+          prerelease: false
+          body: |
+            Release version ${{ env.CARGO_VERSION }}
+            
+            Changes in this release:
+            - See commit history for details
+
+      # Check if there's a binary to package by looking at Cargo.toml
+      - name: Check for binary target
+        if: env.RELEASE_EXISTS == 'false'
+        id: check_binary
+        run: |
+          if grep -q "\\[\\[bin\\]\\]" Cargo.toml || [ -d "src/bin" ]; then
+            echo "HAS_BINARY=true" >> $GITHUB_ENV
+            echo "Binary target found, will package executable"
+          else
+            echo "HAS_BINARY=false" >> $GITHUB_ENV
+            echo "No binary target found, skipping executable packaging"
+          fi
+
+      # Only run these steps if we found a binary target
+      - name: Build and package binary (Linux)
+        if: env.RELEASE_EXISTS == 'false' && env.HAS_BINARY == 'true'
+        run: |
+          cargo build --release
+          # Determine the binary name - it might differ from repo name
+          BINARY_NAME=$(grep -A 1 "\\[\\[bin\\]\\]" Cargo.toml | grep "name" | head -n 1 | sed 's/name = "//g' | sed 's/"//g' || echo "${{ github.event.repository.name }}")
+          # If src/bin exists but no [[bin]] section, use repo name
+          if [ -z "$BINARY_NAME" ]; then
+            BINARY_NAME="${{ github.event.repository.name }}"
+          fi
+          tar -czf ${{ github.event.repository.name }}-${{ env.CARGO_VERSION }}-linux-x86_64.tar.gz -C target/release $BINARY_NAME
+
+      - name: Upload release asset (Linux)
+        if: env.RELEASE_EXISTS == 'false' && env.HAS_BINARY == 'true'
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ${{ github.event.repository.name }}-${{ env.CARGO_VERSION }}-linux-x86_64.tar.gz
+          asset_name: ${{ github.event.repository.name }}-${{ env.CARGO_VERSION }}-linux-x86_64.tar.gz
+          asset_content_type: application/gzip
